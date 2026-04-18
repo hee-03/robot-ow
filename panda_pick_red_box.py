@@ -1,6 +1,6 @@
 """
-Franka Emika Panda - 빨간 네모 박스 pick & place
-PyBullet 시뮬레이션 + OWL-ViT 비전 모듈
+Franka Emika Panda - 다중 물체 pick & place
+PyBullet 시뮬레이션 + OWL-ViT 비전 + NL 파서 + 장애물 회피
 """
 
 import pybullet as p
@@ -17,14 +17,46 @@ FINGER_JOINT_1   = 9
 FINGER_JOINT_2   = 10
 NUM_JOINTS       = 12
 
-# 박스 목표 위치
-BOX_POS          = [-0.5,  0.2,  0.025]   # 바닥에 놓인 상태 (높이 0.05 → 중심 0.025)
-BOX_SIZE         = [0.04, 0.04, 0.05]    # 반치수 (half-extents)
-
 # 작업 높이
-HOVER_HEIGHT     = 0.20   # 박스 중심 위 이 높이에서 하강 시작
-GRASP_HEIGHT     = 0.005  # 박스 표면 위 이 높이까지 하강
-LIFT_HEIGHT      = 0.35   # 들어올릴 최종 높이
+HOVER_HEIGHT     = 0.20   # 물체 상단 위 호버 높이
+GRASP_HEIGHT     = 0.005  # 물체 상단 위 파지 높이
+LIFT_HEIGHT      = 0.35   # 들어올릴 높이
+
+# 장애물 회피 거리
+OBSTACLE_THRESH  = 0.12   # 목적지 반경 (m) 이내면 장애물로 판정
+OBSTACLE_OFFSET  = 0.15   # 장애물을 x, y 각각 이만큼 이동
+
+# ── 씬에 배치할 물체 정의 ─────────────────────────────────────────────────────
+OBJECTS_DEF = [
+    {
+        "name":   "red box",
+        "pos":    [-0.5, 0.2, 0.025],
+        "half_z": 0.05,
+        "shape":  "box",
+        "half":   [0.04, 0.04, 0.05],
+        "color":  [1, 0, 0, 1],
+        "mass":   0.3,
+    },
+    {
+        "name":   "blue cylinder",
+        "pos":    [0.4, -0.2, 0.05],
+        "half_z": 0.05,
+        "shape":  "cylinder",
+        "radius": 0.04,
+        "h_ext":  0.05,
+        "color":  [0, 0.3, 1, 1],
+        "mass":   0.2,
+    },
+    {
+        "name":   "green sphere",
+        "pos":    [0.3, 0.45, 0.04],
+        "half_z": 0.04,
+        "shape":  "sphere",
+        "radius": 0.04,
+        "color":  [0, 0.8, 0, 1],
+        "mass":   0.15,
+    },
+]
 
 # IK 반복 횟수
 IK_ITER          = 100
@@ -84,20 +116,40 @@ def load_panda():
     return robot
 
 
-def load_red_box():
-    col = p.createCollisionShape(p.GEOM_BOX, halfExtents=BOX_SIZE)
-    vis = p.createVisualShape(
-        p.GEOM_BOX,
-        halfExtents=BOX_SIZE,
-        rgbaColor=[1, 0, 0, 1],   # 빨간색
-    )
-    box = p.createMultiBody(
-        baseMass=0.3,
-        baseCollisionShapeIndex=col,
-        baseVisualShapeIndex=vis,
-        basePosition=BOX_POS,
-    )
-    return box
+def load_objects() -> dict:
+    """
+    OBJECTS_DEF에 정의된 물체를 모두 로드.
+    반환: {name: {"body_id": int, "half_z": float, "pos": [x,y,z]}}
+    """
+    registry = {}
+    for obj in OBJECTS_DEF:
+        name  = obj["name"]
+        pos   = obj["pos"]
+        color = obj["color"]
+        mass  = obj["mass"]
+
+        if obj["shape"] == "box":
+            col = p.createCollisionShape(p.GEOM_BOX, halfExtents=obj["half"])
+            vis = p.createVisualShape(p.GEOM_BOX, halfExtents=obj["half"], rgbaColor=color)
+        elif obj["shape"] == "cylinder":
+            col = p.createCollisionShape(p.GEOM_CYLINDER, radius=obj["radius"], height=obj["h_ext"] * 2)
+            vis = p.createVisualShape(p.GEOM_CYLINDER, radius=obj["radius"], length=obj["h_ext"] * 2, rgbaColor=color)
+        elif obj["shape"] == "sphere":
+            col = p.createCollisionShape(p.GEOM_SPHERE, radius=obj["radius"])
+            vis = p.createVisualShape(p.GEOM_SPHERE, radius=obj["radius"], rgbaColor=color)
+        else:
+            continue
+
+        body_id = p.createMultiBody(
+            baseMass=mass,
+            baseCollisionShapeIndex=col,
+            baseVisualShapeIndex=vis,
+            basePosition=pos,
+        )
+        registry[name] = {"body_id": body_id, "half_z": obj["half_z"], "pos": list(pos)}
+        print(f"[Load] '{name}' → body_id={body_id}  pos={pos}")
+
+    return registry
 
 
 # ── IK ───────────────────────────────────────────────────────────────────────
@@ -194,23 +246,99 @@ def scan_360(robot, text_query):
     return None
 
 
+# ── 공통 pick & place ────────────────────────────────────────────────────────
+def pick_and_place(robot, body_id, pick_pos, half_z, place_dest, pid, label="물체"):
+    """
+    단일 물체를 pick_pos에서 집어 place_dest로 이동.
+    pick_pos : 물체 중심 [x, y, z]
+    half_z   : 물체 z 방향 반높이 (top_z = center_z + half_z)
+    place_dest: [x, y, z]
+    """
+    orn_down = p.getQuaternionFromEuler([math.pi, 0, 0])
+    bx, by, bz = pick_pos
+    top_z = bz + half_z
+
+    log(f"{label} Ph1", f"APPROACH  [{bx:.3f}, {by:.3f}, {top_z + HOVER_HEIGHT:.3f}]")
+    joints = solve_ik(robot, [bx, by, top_z + HOVER_HEIGHT], orn_down)
+    set_gripper(robot, 0.04, steps=60)
+    drive_joints(robot, joints, STEPS_APPROACH, pid=pid)
+
+    w1 = p.getJointState(robot, FINGER_JOINT_1)[0]
+    w2 = p.getJointState(robot, FINGER_JOINT_2)[0]
+    if (w1 + w2) < 0.035:
+        set_gripper(robot, 0.04, steps=120)
+
+    log(f"{label} Ph3", f"DESCEND   [{bx:.3f}, {by:.3f}, {top_z + GRASP_HEIGHT:.3f}]  [CAREFUL]")
+    joints = solve_ik(robot, [bx, by, top_z + GRASP_HEIGHT], orn_down)
+    drive_joints(robot, joints, STEPS_DESCEND, pid=PID_CAREFUL)
+
+    log(f"{label} Ph4", "GRASP")
+    set_gripper(robot, 0.01, steps=180)
+    constraint = p.createConstraint(
+        robot, EE_LINK, body_id, -1,
+        p.JOINT_FIXED, [0, 0, 0], [0, 0, 0.05], [0, 0, 0],
+    )
+    for _ in range(STEPS_HOLD):
+        p.stepSimulation()
+        time.sleep(1.0 / 240.0)
+
+    log(f"{label} Ph5", f"LIFT      [{bx:.3f}, {by:.3f}, {LIFT_HEIGHT:.3f}]  [SLOW]")
+    joints = solve_ik(robot, [bx, by, LIFT_HEIGHT], orn_down)
+    drive_joints(robot, joints, STEPS_LIFT, pid=PID_SLOW)
+
+    dx, dy, dz = place_dest
+    log(f"{label} Ph6", f"TRANSIT   [{dx:.3f}, {dy:.3f}, {LIFT_HEIGHT:.3f}]")
+    joints = solve_ik(robot, [dx, dy, LIFT_HEIGHT], orn_down)
+    drive_joints(robot, joints, STEPS_TRANSIT, pid=pid)
+
+    # dz = 목적지 바닥 높이, EE는 물체 상단 + GRASP_HEIGHT 위치까지 내려야 바닥에 닿음
+    place_ee_z = dz + half_z + GRASP_HEIGHT
+    log(f"{label} Ph7", f"PLACE     [{dx:.3f}, {dy:.3f}, {place_ee_z:.3f}]  [CAREFUL]")
+    joints = solve_ik(robot, [dx, dy, place_ee_z], orn_down)
+    drive_joints(robot, joints, STEPS_PLACE_DESC, pid=PID_CAREFUL)
+
+    log(f"{label} Ph8", "RELEASE")
+    p.removeConstraint(constraint)
+    set_gripper(robot, 0.04, steps=120)
+    joints = solve_ik(robot, [dx, dy, LIFT_HEIGHT], orn_down)
+    drive_joints(robot, joints, 800)
+
+
+# ── 장애물 감지 ───────────────────────────────────────────────────────────────
+def find_obstacle(dest, objects, target_name):
+    """
+    dest [x,y,z] 주변 OBSTACLE_THRESH 이내에 target 외 다른 물체가 있으면
+    (name, info_dict) 반환, 없으면 None.
+    """
+    dx, dy = dest[0], dest[1]
+    for name, info in objects.items():
+        if name == target_name:
+            continue
+        ox, oy, _ = p.getBasePositionAndOrientation(info["body_id"])[0]
+        dist = math.sqrt((ox - dx) ** 2 + (oy - dy) ** 2)
+        if dist < OBSTACLE_THRESH:
+            log("Obstacle", f"'{name}'이(가) 목적지 근처에 있습니다 (dist={dist:.3f}m)")
+            return name, info
+    return None
+
+
 # ── 메인 시퀀스 ───────────────────────────────────────────────────────────────
 def run():
-    # ── PyBullet GUI 먼저 실행, 로봇 로드 ────────────────────────────────────
+    # ── PyBullet GUI 먼저 실행, 로봇 + 물체 로드 ─────────────────────────────
     init_sim()
     load_plane()
-    robot = load_panda()
-    box   = load_red_box()
+    robot   = load_panda()
+    objects = load_objects()   # {name: {body_id, half_z, pos}}
 
-    # 시뮬레이션 안정화 (로봇이 화면에 정지 상태로 표시됨)
     for _ in range(120):
         p.stepSimulation()
 
     # ── 자연어 명령 입력 및 파싱 ─────────────────────────────────────────────
-    print("=" * 55)
+    print("=" * 60)
     print(" Franka Panda NL2C — 자연어 명령을 입력하세요")
-    print(" 예) 빨간 네모를 0.3 0.2 0.05 로 빠르게 옮겨줘")
-    print("=" * 55)
+    print(" 예) 빨간 네모를 0.3 0.2 0.025 로 빠르게 옮겨줘")
+    print(" 물체 목록:", ", ".join(objects.keys()))
+    print("=" * 60)
     command = input(">> ").strip()
 
     try:
@@ -225,22 +353,16 @@ def run():
     speed     = parsed["speed_level"]
     pid_user  = PID_PRESETS[speed]
 
-    print(f"\n[명령 확인]")
-    print(f"  객체   : {obj_query}")
-    print(f"  목적지 : {dest}")
-    print(f"  속도   : {speed}  (Kp={pid_user['kp']}, Kd={pid_user['kd']}, max_vel={pid_user['max_vel']})")
-    print()
+    print(f"\n[명령 확인]  객체={obj_query}  목적지={dest}  속도={speed}")
 
-    # ── 스캔 자세로 이동 ──────────────────────────────────────────────────────
+    # ── 스캔 자세 → 360° 회전 탐색 ───────────────────────────────────────────
     log("Scan", "스캔 자세로 이동 중...")
     move_to_scan_pose(robot)
-
-    # ── 360도 회전 스캔으로 박스 탐색 ────────────────────────────────────────
     log("Scan", f"360° 회전 스캔 시작 ('{obj_query}')")
     result = scan_360(robot, obj_query)
 
     if result is None:
-        print("[오류] 360° 스캔 완료 후에도 빨간 박스를 찾지 못했습니다.")
+        print(f"[오류] '{obj_query}'을(를) 찾지 못했습니다.")
         p.disconnect()
         return
 
@@ -250,88 +372,50 @@ def run():
             p.disconnect()
             return
 
-    # 비전 결과 사용, 신뢰도 낮으면 GT 폴백
+    # 비전 좌표 or GT 폴백
     if result.confidence >= CONF_HIGH:
-        bx, by, bz = result.world_pos
-        log("Vision", f"OWL-ViT 좌표: [{bx:.3f}, {by:.3f}, {bz:.3f}]  (conf={result.confidence:.2f})")
+        pick_pos = list(result.world_pos)
+        log("Vision", f"OWL-ViT 좌표: {[round(v,3) for v in pick_pos]}  (conf={result.confidence:.2f})")
     else:
-        box_pos, _ = p.getBasePositionAndOrientation(box)
-        bx, by, bz = box_pos
-        log("Vision", f"GT 좌표 폴백: [{bx:.3f}, {by:.3f}, {bz:.3f}]")
+        target_info = objects.get(obj_query)
+        if target_info:
+            pick_pos = list(p.getBasePositionAndOrientation(target_info["body_id"])[0])
+        else:
+            pick_pos = list(result.world_pos)
+        log("Vision", f"GT 폴백: {[round(v,3) for v in pick_pos]}")
 
-    top_z = bz + BOX_SIZE[2]
+    # target half_z (OWL-ViT 결과면 objects에서 찾고, 없으면 기본값)
+    target_info = objects.get(obj_query, {})
+    half_z = target_info.get("half_z", 0.05)
+    body_id = target_info.get("body_id")
 
-    orn_down = p.getQuaternionFromEuler([math.pi, 0, 0])
+    # body_id 미확인 시 가장 가까운 물체로 추정
+    if body_id is None:
+        min_dist, body_id, half_z = float("inf"), None, 0.05
+        for info in objects.values():
+            pos, _ = p.getBasePositionAndOrientation(info["body_id"])
+            d = math.sqrt(sum((a - b) ** 2 for a, b in zip(pos, pick_pos)))
+            if d < min_dist:
+                min_dist, body_id, half_z = d, info["body_id"], info["half_z"]
 
-    # ── Phase 1 : APPROACH (박스 위 호버) ──────────────────────────────────
-    log("Phase 1", f"APPROACH → [{bx:.3f}, {by:.3f}, {top_z + HOVER_HEIGHT:.3f}]")
-    hover_pos = [bx, by, top_z + HOVER_HEIGHT]
-    joints    = solve_ik(robot, hover_pos, orn_down)
-    set_gripper(robot, 0.04, steps=60)
-    drive_joints(robot, joints, STEPS_APPROACH, pid=pid_user)
+    # ── 장애물 감지 및 회피 ───────────────────────────────────────────────────
+    obstacle = find_obstacle(dest, objects, obj_query)
+    if obstacle:
+        obs_name, obs_info = obstacle
+        obs_pos = list(p.getBasePositionAndOrientation(obs_info["body_id"])[0])
+        obs_dest = [obs_pos[0] + OBSTACLE_OFFSET, obs_pos[1] + OBSTACLE_OFFSET, obs_pos[2]]
+        log("Obstacle", f"'{obs_name}' → [{obs_dest[0]:.3f}, {obs_dest[1]:.3f}]로 회피 이동")
+        pick_and_place(robot, obs_info["body_id"], obs_pos, obs_info["half_z"],
+                       obs_dest, PID_PRESETS["normal"], label=obs_name)
 
-    # ── Phase 2 : GRIPPER OPEN CONFIRM ────────────────────────────────────
-    log("Phase 2", "GRIPPER_OPEN_CONFIRM")
-    w1 = p.getJointState(robot, FINGER_JOINT_1)[0]
-    w2 = p.getJointState(robot, FINGER_JOINT_2)[0]
-    if (w1 + w2) < 0.035:
-        print("  ⚠ 그리퍼가 충분히 열리지 않았습니다. 강제 개방합니다.")
-        set_gripper(robot, 0.04, steps=120)
+    # ── 목표 물체 pick & place ────────────────────────────────────────────────
+    log("Task", f"'{obj_query}' pick & place 시작")
+    pick_and_place(robot, body_id, pick_pos, half_z, dest, pid_user, label=obj_query)
 
-    # ── Phase 3 : DESCEND (박스 표면까지 하강) ────────────────────────────
-    log("Phase 3", f"DESCEND → [{bx:.3f}, {by:.3f}, {top_z + GRASP_HEIGHT:.3f}]  [CAREFUL 강제]")
-    grasp_pos = [bx, by, top_z + GRASP_HEIGHT]
-    joints    = solve_ik(robot, grasp_pos, orn_down)
-    drive_joints(robot, joints, STEPS_DESCEND, pid=PID_CAREFUL)
+    final_pos, _ = p.getBasePositionAndOrientation(body_id)
+    log("완료", f"최종 위치: {[round(v,3) for v in final_pos]}")
+    print(f"\n→ TASK_COMPLETE  ('{obj_query}'을(를) {dest}에 내려놓았습니다.)")
 
-    # ── Phase 4 : GRASP ───────────────────────────────────────────────────
-    log("Phase 4", "GRASP → 그리퍼 폐쇄")
-    set_gripper(robot, 0.01, steps=180)   # 박스 두께에 맞게 닫기
-    # 고정 제약으로 안정적 파지 시뮬레이션
-    constraint = p.createConstraint(
-        robot, EE_LINK, box, -1,
-        p.JOINT_FIXED, [0, 0, 0], [0, 0, 0.05], [0, 0, 0],
-    )
-    for _ in range(STEPS_HOLD):
-        p.stepSimulation()
-        time.sleep(1.0 / 240.0)
-    log("Phase 4", "파지 성공 ✅")
-
-    # ── Phase 5 : LIFT ────────────────────────────────────────────────────
-    log("Phase 5", f"LIFT → [{bx:.3f}, {by:.3f}, {LIFT_HEIGHT:.3f}]  [SLOW 최소]")
-    lift_pos = [bx, by, LIFT_HEIGHT]
-    joints   = solve_ik(robot, lift_pos, orn_down)
-    drive_joints(robot, joints, STEPS_LIFT, pid=PID_SLOW)
-
-    # ── Phase 6 : TRANSIT (목적지 위로 이동) ─────────────────────────────
-    dest_x, dest_y, dest_z = dest[0], dest[1], dest[2]
-    log("Phase 6", f"TRANSIT → [{dest_x:.3f}, {dest_y:.3f}, {LIFT_HEIGHT:.3f}]")
-    transit_pos = [dest_x, dest_y, LIFT_HEIGHT]
-    joints      = solve_ik(robot, transit_pos, orn_down)
-    drive_joints(robot, joints, STEPS_TRANSIT, pid=pid_user)
-
-    # ── Phase 7 : PLACE_DESCEND (박스 내려놓기) ──────────────────────────
-    log("Phase 7", f"PLACE_DESCEND → [{dest_x:.3f}, {dest_y:.3f}, {dest_z:.3f}]  [CAREFUL 강제]")
-    place_pos = [dest_x, dest_y, dest_z]
-    joints    = solve_ik(robot, place_pos, orn_down)
-    drive_joints(robot, joints, STEPS_PLACE_DESC, pid=PID_CAREFUL)
-
-    # ── Phase 8 : RELEASE ────────────────────────────────────────────────
-    log("Phase 8", "RELEASE → 제약 해제 + 그리퍼 개방")
-    p.removeConstraint(constraint)
-    set_gripper(robot, 0.04, steps=120)
-
-    # 후퇴 (엔드이펙터 위로 올림)
-    retract_pos = [dest_x, dest_y, LIFT_HEIGHT]
-    joints      = solve_ik(robot, retract_pos, orn_down)
-    drive_joints(robot, joints, 800)
-
-    # 결과 확인
-    box_final, _ = p.getBasePositionAndOrientation(box)
-    log("완료", f"박스 최종 위치: {[round(v,3) for v in box_final]}")
-    print(f"\n→ TASK_COMPLETE  ('{obj_query}'을(를) [{dest_x:.3f}, {dest_y:.3f}, {dest_z:.3f}]에 내려놓았습니다.)")
-
-    # 화면 유지
     print("시뮬레이션 종료하려면 Ctrl+C를 누르세요.")
     try:
         while True:
