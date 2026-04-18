@@ -7,7 +7,7 @@ import pybullet as p
 import pybullet_data
 import time
 import math
-from vision import find_object, CONF_HIGH
+from vision import CONF_HIGH, CONF_LOW, capture_ee_camera, detect_multiple, pixel_to_world
 from nl_parser import parse_command
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
@@ -39,7 +39,7 @@ OBJECTS_DEF = [
     },
     {
         "name":   "blue cylinder",
-        "pos":    [0.4, -0.2, 0.05],
+        "pos":    [0.4, -0.4, 0.05],
         "half_z": 0.05,
         "shape":  "cylinder",
         "radius": 0.04,
@@ -201,8 +201,8 @@ def log(phase, msg=""):
 
 # ── 360도 스캔 ────────────────────────────────────────────────────────────────
 SCAN_POSE = [0, -0.4, 0, -2.0, 0, 1.8, math.pi/4, 0.04, 0.04, 0, 0, 0]
-SCAN_STEP_DEG  = 20    # 몇 도마다 OWL-ViT 탐색할지
-SCAN_SIM_STEPS = 80    # 각 회전 구간 시뮬레이션 스텝 수
+SCAN_STEP_DEG  = 10    # 몇 도마다 OWL-ViT 탐색할지
+SCAN_SIM_STEPS = 200    # 각 회전 구간 시뮬레이션 스텝 수
 
 
 def move_to_scan_pose(robot):
@@ -217,33 +217,88 @@ def move_to_scan_pose(robot):
         time.sleep(1.0 / 240.0)
 
 
-def scan_360(robot, text_query):
+JOINT_LIMIT_DEG = 160   # 안전 탐색 한계 (Panda Joint 0 최대 ±166°)
+RETURN_STEPS    = 400   # 원위치 복귀용 시뮬레이션 스텝 수
+
+
+def _drive_joint0(robot, target_rad: float, steps: int = SCAN_SIM_STEPS):
+    """Joint 0만 목표 각도로 구동."""
+    for _ in range(steps):
+        p.setJointMotorControl2(robot, 0, p.POSITION_CONTROL,
+                                targetPosition=target_rad,
+                                positionGain=0.8, velocityGain=0.5,
+                                maxVelocity=0.5, force=MAX_FORCE)
+        p.stepSimulation()
+        time.sleep(1.0 / 240.0)
+
+def drive_joint0_until(robot, target_rad, tol=0.01, max_steps=1000):
+    """Joint0이 목표 각도에 도달할 때까지 구동"""
+    for _ in range(max_steps):
+        current = p.getJointState(robot, 0)[0]
+
+        if abs(current - target_rad) < tol:
+            break
+
+        p.setJointMotorControl2(robot, 0, p.POSITION_CONTROL,
+                                targetPosition=target_rad,
+                                positionGain=0.8, velocityGain=0.5,
+                                maxVelocity=0.8, force=MAX_FORCE)
+
+        p.stepSimulation()
+        time.sleep(1.0 / 240.0)
+
+def scan_full_range(robot, object_names: list) -> dict:
     """
-    Joint 0을 360도 회전하며 SCAN_STEP_DEG마다 OWL-ViT 탐색.
-    처음 신뢰도 OK 결과를 반환, 못 찾으면 None.
+    시작 위치(0 rad)에서 두 페이즈로 전방위 탐색.
+      Phase 1 (CCW): 0 → +160°  반시계 방향
+      Phase 2 (CW) : 0 → -160°  시계 방향
+    객체 감지 시 즉시 이름 + 월드 좌표 출력.
+    반환: {name: (score, world_pos)} — 미발견이면 None
     """
-    start_angle = p.getJointState(robot, 0)[0]
-    total_steps = int(360 / SCAN_STEP_DEG)
+    detected = {n: None for n in object_names}
+    reported = set()
 
-    for i in range(total_steps):
-        target_angle = start_angle + math.radians(SCAN_STEP_DEG * (i + 1))
-        log("Scan", f"{SCAN_STEP_DEG * (i+1)}° 회전 중...")
+    phases = [
+        ("반시계(CCW) +{}°".format(JOINT_LIMIT_DEG),
+         [math.radians(d) for d in range(SCAN_STEP_DEG, JOINT_LIMIT_DEG + 1, SCAN_STEP_DEG)]),
+        ("시계(CW)   -{}°".format(JOINT_LIMIT_DEG),
+         [math.radians(-d) for d in range(SCAN_STEP_DEG, JOINT_LIMIT_DEG + 1, SCAN_STEP_DEG)]),
+    ]
 
-        # Joint 0만 목표 각도로 구동
-        for _ in range(SCAN_SIM_STEPS):
-            p.setJointMotorControl2(robot, 0, p.POSITION_CONTROL,
-                                    targetPosition=target_angle,
-                                    positionGain=0.8, velocityGain=0.5,
-                                    maxVelocity=0.5, force=MAX_FORCE)
-            p.stepSimulation()
-            time.sleep(1.0 / 240.0)
+    for phase_label, angles in phases:
+        log("Scan", f"── {phase_label} 탐색 시작 ──")
 
-        result = find_object(robot, EE_LINK, text_query)
-        if result.status in ("OK", "LOW_CONF"):
-            log("Scan", f"객체 발견! conf={result.confidence:.2f}  pos={[round(v,3) for v in result.world_pos]}")
-            return result
+        for target_rad in angles:
+            _drive_joint0(robot, target_rad)
 
-    return None
+            for _ in range(2):   # ← 여기 추가
+                rgb, depth_m, view_mat = capture_ee_camera(robot, EE_LINK)
+                results = detect_multiple(rgb, object_names)
+
+                for name, det in results.items():
+                    if det is None:
+                        continue
+                    cx, cy, score, _ = det
+                    if score < CONF_LOW:
+                        continue
+                    world_pos = pixel_to_world(cx, cy, depth_m, view_mat)
+                    if world_pos is None:
+                        continue
+
+                    if detected[name] is None or score > detected[name][0]:
+                        detected[name] = (score, world_pos)
+
+                    if name not in reported:
+                        reported.add(name)
+                        pos = [round(float(v), 3) for v in world_pos]
+                        print(f"  └─ '{name}' 감지  conf={score:.2f}  좌표={pos}")
+
+        log("Scan", f"── {phase_label} 완료, 원위치 복귀 ──")
+        drive_joint0_until(robot, 0.0)
+
+    found = [n for n, v in detected.items() if v is not None]
+    log("Scan", f"탐색 완료 — {len(found)}개 감지: {found}")
+    return detected
 
 
 # ── 공통 pick & place ────────────────────────────────────────────────────────
@@ -355,33 +410,40 @@ def run():
 
     print(f"\n[명령 확인]  객체={obj_query}  목적지={dest}  속도={speed}")
 
-    # ── 스캔 자세 → 360° 회전 탐색 ───────────────────────────────────────────
+    # ── 스캔 자세 → CCW/CW 전방위 탐색 ──────────────────────────────────────
+    log("Vision", "모델 사전 로딩 중...")
+    dummy_rgb = capture_ee_camera(robot, EE_LINK)[0]
+    _ = detect_multiple(dummy_rgb, ["red box"])
+    log("Vision", "모델 로딩 완료")
+
     log("Scan", "스캔 자세로 이동 중...")
     move_to_scan_pose(robot)
-    log("Scan", f"360° 회전 스캔 시작 ('{obj_query}')")
-    result = scan_360(robot, obj_query)
+    all_names    = list(objects.keys())
+    scan_results = scan_full_range(robot, all_names)
 
-    if result is None:
+    scan_hit = scan_results.get(obj_query)
+    if scan_hit is None:
         print(f"[오류] '{obj_query}'을(를) 찾지 못했습니다.")
         p.disconnect()
         return
 
-    if result.status == "LOW_CONF":
-        ans = input(f"  신뢰도 {result.confidence:.2f} — 계속 진행하시겠습니까? (y/n): ")
+    score, world_pos = scan_hit
+    if score < CONF_HIGH:
+        ans = input(f"  신뢰도 {score:.2f} — 계속 진행하시겠습니까? (y/n): ")
         if ans.strip().lower() != "y":
             p.disconnect()
             return
 
     # 비전 좌표 or GT 폴백
-    if result.confidence >= CONF_HIGH:
-        pick_pos = list(result.world_pos)
-        log("Vision", f"OWL-ViT 좌표: {[round(v,3) for v in pick_pos]}  (conf={result.confidence:.2f})")
+    if score >= CONF_HIGH:
+        pick_pos = [float(v) for v in world_pos]
+        log("Vision", f"OWL-ViT 좌표: {[round(v,3) for v in pick_pos]}  (conf={score:.2f})")
     else:
         target_info = objects.get(obj_query)
         if target_info:
             pick_pos = list(p.getBasePositionAndOrientation(target_info["body_id"])[0])
         else:
-            pick_pos = list(result.world_pos)
+            pick_pos = [float(v) for v in world_pos]
         log("Vision", f"GT 폴백: {[round(v,3) for v in pick_pos]}")
 
     # target half_z (OWL-ViT 결과면 objects에서 찾고, 없으면 기본값)

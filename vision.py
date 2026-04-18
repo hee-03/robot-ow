@@ -114,6 +114,39 @@ def detect_object(rgb: np.ndarray, text_query: str):
     return cx, cy, score, box
 
 
+# ── OWL-ViT 다중 쿼리 동시 검출 ──────────────────────────────────────────────
+def detect_multiple(rgb: np.ndarray, text_queries: list) -> dict:
+    """
+    여러 텍스트 쿼리를 한 번의 추론으로 동시에 검출.
+    반환: {query: (cx, cy, score, box)} — 미검출이면 해당 키 값 None
+    """
+    _load_model()
+
+    pil_img = Image.fromarray(rgb)
+    inputs  = _processor(text=[text_queries], images=pil_img, return_tensors="pt")
+
+    with torch.no_grad():
+        outputs = _model(**inputs)
+
+    target_sizes = torch.tensor([[IMG_H, IMG_W]])
+    results = _processor.post_process_grounded_object_detection(
+        outputs, threshold=0.1, target_sizes=target_sizes
+    )[0]
+
+    detected = {q: None for q in text_queries}
+
+    for score, label_idx, box in zip(results["scores"], results["labels"], results["boxes"]):
+        score = score.item()
+        label = text_queries[label_idx.item()]
+        box   = box.tolist()
+        if detected[label] is None or score > detected[label][2]:
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            detected[label] = (cx, cy, score, box)
+
+    return detected
+
+
 # ── Deprojection: 픽셀 + depth → 월드 좌표 ───────────────────────────────────
 def pixel_to_world(cx_px: float, cy_px: float,
                    depth_m: np.ndarray, view_mat) -> np.ndarray | None:
