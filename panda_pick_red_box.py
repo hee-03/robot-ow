@@ -8,6 +8,7 @@ import pybullet_data
 import time
 import math
 from vision import find_object, CONF_HIGH
+from nl_parser import parse_command
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 PANDA_URDF       = "franka_panda/panda.urdf"
@@ -28,11 +29,18 @@ LIFT_HEIGHT      = 0.35   # 들어올릴 최종 높이
 # IK 반복 횟수
 IK_ITER          = 100
 
-# PID - CAREFUL 프리셋
-KP               = 0.3
-KD               = 0.8
-MAX_VEL          = 0.05
 MAX_FORCE        = 87.0
+
+# PID 프리셋 테이블
+PID_PRESETS = {
+    "careful": dict(kp=0.3,  kd=0.8,  max_vel=0.05),
+    "slow":    dict(kp=0.5,  kd=0.5,  max_vel=0.10),
+    "normal":  dict(kp=0.8,  kd=0.3,  max_vel=0.20),
+    "fast":    dict(kp=1.5,  kd=0.1,  max_vel=0.40),
+}
+# 강제 적용 프리셋 (페이즈별)
+PID_CAREFUL = PID_PRESETS["careful"]
+PID_SLOW    = PID_PRESETS["slow"]
 
 # 각 페이즈 스텝 수
 STEPS_APPROACH   = 1500
@@ -106,16 +114,18 @@ def solve_ik(robot, target_pos, target_orn=None):
 
 
 # ── 관절 구동 ─────────────────────────────────────────────────────────────────
-def drive_joints(robot, target_joints, steps):
+def drive_joints(robot, target_joints, steps, pid=None):
+    if pid is None:
+        pid = PID_PRESETS["normal"]
     for _ in range(steps):
         for j in range(7):   # 7-DOF 암 관절만
             p.setJointMotorControl2(
                 robot, j,
                 p.POSITION_CONTROL,
                 targetPosition=target_joints[j],
-                positionGain=KP,
-                velocityGain=KD,
-                maxVelocity=MAX_VEL,
+                positionGain=pid["kp"],
+                velocityGain=pid["kd"],
+                maxVelocity=pid["max_vel"],
                 force=MAX_FORCE,
             )
         p.stepSimulation()
@@ -186,22 +196,48 @@ def scan_360(robot, text_query):
 
 # ── 메인 시퀀스 ───────────────────────────────────────────────────────────────
 def run():
+    # ── PyBullet GUI 먼저 실행, 로봇 로드 ────────────────────────────────────
     init_sim()
     load_plane()
     robot = load_panda()
     box   = load_red_box()
 
-    # 시뮬레이션 안정화
+    # 시뮬레이션 안정화 (로봇이 화면에 정지 상태로 표시됨)
     for _ in range(120):
         p.stepSimulation()
+
+    # ── 자연어 명령 입력 및 파싱 ─────────────────────────────────────────────
+    print("=" * 55)
+    print(" Franka Panda NL2C — 자연어 명령을 입력하세요")
+    print(" 예) 빨간 네모를 0.3 0.2 0.05 로 빠르게 옮겨줘")
+    print("=" * 55)
+    command = input(">> ").strip()
+
+    try:
+        parsed = parse_command(command)
+    except Exception as e:
+        print(f"[오류] 명령 파싱 실패: {e}")
+        p.disconnect()
+        return
+
+    obj_query = parsed["object"]
+    dest      = parsed["destination"]
+    speed     = parsed["speed_level"]
+    pid_user  = PID_PRESETS[speed]
+
+    print(f"\n[명령 확인]")
+    print(f"  객체   : {obj_query}")
+    print(f"  목적지 : {dest}")
+    print(f"  속도   : {speed}  (Kp={pid_user['kp']}, Kd={pid_user['kd']}, max_vel={pid_user['max_vel']})")
+    print()
 
     # ── 스캔 자세로 이동 ──────────────────────────────────────────────────────
     log("Scan", "스캔 자세로 이동 중...")
     move_to_scan_pose(robot)
 
     # ── 360도 회전 스캔으로 박스 탐색 ────────────────────────────────────────
-    log("Scan", "360° 회전 스캔 시작 ('red box')")
-    result = scan_360(robot, "red box")
+    log("Scan", f"360° 회전 스캔 시작 ('{obj_query}')")
+    result = scan_360(robot, obj_query)
 
     if result is None:
         print("[오류] 360° 스캔 완료 후에도 빨간 박스를 찾지 못했습니다.")
@@ -231,8 +267,8 @@ def run():
     log("Phase 1", f"APPROACH → [{bx:.3f}, {by:.3f}, {top_z + HOVER_HEIGHT:.3f}]")
     hover_pos = [bx, by, top_z + HOVER_HEIGHT]
     joints    = solve_ik(robot, hover_pos, orn_down)
-    set_gripper(robot, 0.04, steps=60)   # 그리퍼 열기
-    drive_joints(robot, joints, STEPS_APPROACH)
+    set_gripper(robot, 0.04, steps=60)
+    drive_joints(robot, joints, STEPS_APPROACH, pid=pid_user)
 
     # ── Phase 2 : GRIPPER OPEN CONFIRM ────────────────────────────────────
     log("Phase 2", "GRIPPER_OPEN_CONFIRM")
@@ -246,7 +282,7 @@ def run():
     log("Phase 3", f"DESCEND → [{bx:.3f}, {by:.3f}, {top_z + GRASP_HEIGHT:.3f}]  [CAREFUL 강제]")
     grasp_pos = [bx, by, top_z + GRASP_HEIGHT]
     joints    = solve_ik(robot, grasp_pos, orn_down)
-    drive_joints(robot, joints, STEPS_DESCEND)
+    drive_joints(robot, joints, STEPS_DESCEND, pid=PID_CAREFUL)
 
     # ── Phase 4 : GRASP ───────────────────────────────────────────────────
     log("Phase 4", "GRASP → 그리퍼 폐쇄")
@@ -265,23 +301,20 @@ def run():
     log("Phase 5", f"LIFT → [{bx:.3f}, {by:.3f}, {LIFT_HEIGHT:.3f}]  [SLOW 최소]")
     lift_pos = [bx, by, LIFT_HEIGHT]
     joints   = solve_ik(robot, lift_pos, orn_down)
-    drive_joints(robot, joints, STEPS_LIFT)
+    drive_joints(robot, joints, STEPS_LIFT, pid=PID_SLOW)
 
     # ── Phase 6 : TRANSIT (목적지 위로 이동) ─────────────────────────────
-    dest_x = bx
-    dest_y = by + PLACE_Y_OFFSET
-    dest_z = bz   # 원래 바닥 높이 기준
+    dest_x, dest_y, dest_z = dest[0], dest[1], dest[2]
     log("Phase 6", f"TRANSIT → [{dest_x:.3f}, {dest_y:.3f}, {LIFT_HEIGHT:.3f}]")
     transit_pos = [dest_x, dest_y, LIFT_HEIGHT]
     joints      = solve_ik(robot, transit_pos, orn_down)
-    drive_joints(robot, joints, STEPS_TRANSIT)
+    drive_joints(robot, joints, STEPS_TRANSIT, pid=pid_user)
 
     # ── Phase 7 : PLACE_DESCEND (박스 내려놓기) ──────────────────────────
-    place_z = dest_z + BOX_SIZE[2] + 0.01   # 바닥 + 박스 반높이 + 여유
-    log("Phase 7", f"PLACE_DESCEND → [{dest_x:.3f}, {dest_y:.3f}, {place_z:.3f}]  [CAREFUL 강제]")
-    place_pos = [dest_x, dest_y, place_z]
+    log("Phase 7", f"PLACE_DESCEND → [{dest_x:.3f}, {dest_y:.3f}, {dest_z:.3f}]  [CAREFUL 강제]")
+    place_pos = [dest_x, dest_y, dest_z]
     joints    = solve_ik(robot, place_pos, orn_down)
-    drive_joints(robot, joints, STEPS_PLACE_DESC)
+    drive_joints(robot, joints, STEPS_PLACE_DESC, pid=PID_CAREFUL)
 
     # ── Phase 8 : RELEASE ────────────────────────────────────────────────
     log("Phase 8", "RELEASE → 제약 해제 + 그리퍼 개방")
@@ -296,7 +329,7 @@ def run():
     # 결과 확인
     box_final, _ = p.getBasePositionAndOrientation(box)
     log("완료", f"박스 최종 위치: {[round(v,3) for v in box_final]}")
-    print(f"\n→ TASK_COMPLETE  (빨간 네모 박스를 [{dest_x:.2f}, {dest_y:.2f}, {dest_z:.3f}]에 내려놓았습니다.)")
+    print(f"\n→ TASK_COMPLETE  ('{obj_query}'을(를) [{dest_x:.3f}, {dest_y:.3f}, {dest_z:.3f}]에 내려놓았습니다.)")
 
     # 화면 유지
     print("시뮬레이션 종료하려면 Ctrl+C를 누르세요.")
