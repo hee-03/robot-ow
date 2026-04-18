@@ -1,12 +1,13 @@
 """
-Franka Emika Panda - 빨간 네모 박스 집어올리기
-PyBullet 시뮬레이션
+Franka Emika Panda - 빨간 네모 박스 pick & place
+PyBullet 시뮬레이션 + OWL-ViT 비전 모듈
 """
 
 import pybullet as p
 import pybullet_data
 import time
 import math
+from vision import find_object, CONF_HIGH
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 PANDA_URDF       = "franka_panda/panda.urdf"
@@ -16,7 +17,7 @@ FINGER_JOINT_2   = 10
 NUM_JOINTS       = 12
 
 # 박스 목표 위치
-BOX_POS          = [0.5,  0.0,  0.025]   # 바닥에 놓인 상태 (높이 0.05 → 중심 0.025)
+BOX_POS          = [-0.5,  0.2,  0.025]   # 바닥에 놓인 상태 (높이 0.05 → 중심 0.025)
 BOX_SIZE         = [0.04, 0.04, 0.05]    # 반치수 (half-extents)
 
 # 작업 높이
@@ -136,6 +137,53 @@ def log(phase, msg=""):
     print(f"[{phase}] {msg}")
 
 
+# ── 360도 스캔 ────────────────────────────────────────────────────────────────
+SCAN_POSE = [0, -0.4, 0, -2.0, 0, 1.8, math.pi/4, 0.04, 0.04, 0, 0, 0]
+SCAN_STEP_DEG  = 20    # 몇 도마다 OWL-ViT 탐색할지
+SCAN_SIM_STEPS = 80    # 각 회전 구간 시뮬레이션 스텝 수
+
+
+def move_to_scan_pose(robot):
+    """스캔에 유리한 자세로 이동 (팔 뻗고 약간 아래를 향함)"""
+    for _ in range(600):
+        for j in range(NUM_JOINTS):
+            p.setJointMotorControl2(robot, j, p.POSITION_CONTROL,
+                                    targetPosition=SCAN_POSE[j],
+                                    positionGain=0.5, velocityGain=0.5,
+                                    maxVelocity=0.3, force=MAX_FORCE)
+        p.stepSimulation()
+        time.sleep(1.0 / 240.0)
+
+
+def scan_360(robot, text_query):
+    """
+    Joint 0을 360도 회전하며 SCAN_STEP_DEG마다 OWL-ViT 탐색.
+    처음 신뢰도 OK 결과를 반환, 못 찾으면 None.
+    """
+    start_angle = p.getJointState(robot, 0)[0]
+    total_steps = int(360 / SCAN_STEP_DEG)
+
+    for i in range(total_steps):
+        target_angle = start_angle + math.radians(SCAN_STEP_DEG * (i + 1))
+        log("Scan", f"{SCAN_STEP_DEG * (i+1)}° 회전 중...")
+
+        # Joint 0만 목표 각도로 구동
+        for _ in range(SCAN_SIM_STEPS):
+            p.setJointMotorControl2(robot, 0, p.POSITION_CONTROL,
+                                    targetPosition=target_angle,
+                                    positionGain=0.8, velocityGain=0.5,
+                                    maxVelocity=0.5, force=MAX_FORCE)
+            p.stepSimulation()
+            time.sleep(1.0 / 240.0)
+
+        result = find_object(robot, EE_LINK, text_query)
+        if result.status in ("OK", "LOW_CONF"):
+            log("Scan", f"객체 발견! conf={result.confidence:.2f}  pos={[round(v,3) for v in result.world_pos]}")
+            return result
+
+    return None
+
+
 # ── 메인 시퀀스 ───────────────────────────────────────────────────────────────
 def run():
     init_sim()
@@ -147,9 +195,35 @@ def run():
     for _ in range(120):
         p.stepSimulation()
 
-    box_pos, _ = p.getBasePositionAndOrientation(box)
-    bx, by, bz = box_pos
-    top_z = bz + BOX_SIZE[2]   # 박스 상단 Z
+    # ── 스캔 자세로 이동 ──────────────────────────────────────────────────────
+    log("Scan", "스캔 자세로 이동 중...")
+    move_to_scan_pose(robot)
+
+    # ── 360도 회전 스캔으로 박스 탐색 ────────────────────────────────────────
+    log("Scan", "360° 회전 스캔 시작 ('red box')")
+    result = scan_360(robot, "red box")
+
+    if result is None:
+        print("[오류] 360° 스캔 완료 후에도 빨간 박스를 찾지 못했습니다.")
+        p.disconnect()
+        return
+
+    if result.status == "LOW_CONF":
+        ans = input(f"  신뢰도 {result.confidence:.2f} — 계속 진행하시겠습니까? (y/n): ")
+        if ans.strip().lower() != "y":
+            p.disconnect()
+            return
+
+    # 비전 결과 사용, 신뢰도 낮으면 GT 폴백
+    if result.confidence >= CONF_HIGH:
+        bx, by, bz = result.world_pos
+        log("Vision", f"OWL-ViT 좌표: [{bx:.3f}, {by:.3f}, {bz:.3f}]  (conf={result.confidence:.2f})")
+    else:
+        box_pos, _ = p.getBasePositionAndOrientation(box)
+        bx, by, bz = box_pos
+        log("Vision", f"GT 좌표 폴백: [{bx:.3f}, {by:.3f}, {bz:.3f}]")
+
+    top_z = bz + BOX_SIZE[2]
 
     orn_down = p.getQuaternionFromEuler([math.pi, 0, 0])
 
