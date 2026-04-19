@@ -114,6 +114,39 @@ def detect_object(rgb: np.ndarray, text_query: str):
     return cx, cy, score, box
 
 
+# ── OWL-ViT 다중 쿼리 동시 검출 ──────────────────────────────────────────────
+def detect_multiple(rgb: np.ndarray, text_queries: list) -> dict:
+    """
+    여러 텍스트 쿼리를 한 번의 추론으로 동시에 검출.
+    반환: {query: (cx, cy, score, box)} — 미검출이면 해당 키 값 None
+    """
+    _load_model()
+
+    pil_img = Image.fromarray(rgb)
+    inputs  = _processor(text=[text_queries], images=pil_img, return_tensors="pt")
+
+    with torch.no_grad():
+        outputs = _model(**inputs)
+
+    target_sizes = torch.tensor([[IMG_H, IMG_W]])
+    results = _processor.post_process_grounded_object_detection(
+        outputs, threshold=0.1, target_sizes=target_sizes
+    )[0]
+
+    detected = {q: None for q in text_queries}
+
+    for score, label_idx, box in zip(results["scores"], results["labels"], results["boxes"]):
+        score = score.item()
+        label = text_queries[label_idx.item()]
+        box   = box.tolist()
+        if detected[label] is None or score > detected[label][2]:
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            detected[label] = (cx, cy, score, box)
+
+    return detected
+
+
 # ── Deprojection: 픽셀 + depth → 월드 좌표 ───────────────────────────────────
 def pixel_to_world(cx_px: float, cy_px: float,
                    depth_m: np.ndarray, view_mat) -> np.ndarray | None:
@@ -152,7 +185,7 @@ class VisionResult:
         self.world_pos  = world_pos    # np.ndarray [x,y,z] 또는 None
         self.confidence = confidence
         self.box_xyxy   = box_xyxy
-        self.status     = status       # "OK" | "LOW_CONF" | "NOT_FOUND" | "DEPTH_INVALID"
+        self.status     = status       # "OK" | "LOW_CONF" | "GT_FALLBACK" | "NOT_FOUND" | "DEPTH_INVALID"
 
     def __repr__(self):
         if self.world_pos is not None:
@@ -163,9 +196,13 @@ class VisionResult:
                 f"conf={self.confidence:.3f}, world_pos={pos})")
 
 
-def find_object(robot_id: int, ee_link: int, text_query: str) -> VisionResult:
+def find_object(robot_id: int, ee_link: int, text_query: str,
+                gt_body_id: int | None = None) -> VisionResult:
     """
     엔드이펙터 카메라로 text_query 객체를 탐색하고 3D 월드 좌표를 반환.
+
+    gt_body_id: PyBullet body ID. 신뢰도가 CONF_LOW~CONF_HIGH 구간일 때
+                해당 body의 GT 좌표로 폴백한다. None이면 폴백 없이 LOW_CONF 반환.
     """
     rgb, depth_m, view_mat = capture_ee_camera(robot_id, ee_link)
 
@@ -182,7 +219,14 @@ def find_object(robot_id: int, ee_link: int, text_query: str) -> VisionResult:
         return VisionResult(None, conf, box, "NOT_FOUND")
 
     if conf < CONF_HIGH:
-        print(f"[Vision] ⚠ 신뢰도 낮음 ({conf:.3f}). 오퍼레이터 확인이 필요합니다.")
+        print(f"[Vision] ⚠ 신뢰도 낮음 ({conf:.3f}, {CONF_LOW}~{CONF_HIGH}).")
+        if gt_body_id is not None:
+            gt_pos, _ = p.getBasePositionAndOrientation(gt_body_id)
+            world_pos = np.array(gt_pos, dtype=np.float64)
+            print(f"[Vision] GT 폴백 적용 (body_id={gt_body_id}): "
+                  f"{[round(v, 4) for v in world_pos]}")
+            return VisionResult(world_pos, conf, box, "GT_FALLBACK")
+        print("[Vision] gt_body_id 미제공 — LOW_CONF로 비전 좌표 사용.")
         status = "LOW_CONF"
     else:
         status = "OK"
