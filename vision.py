@@ -185,7 +185,7 @@ class VisionResult:
         self.world_pos  = world_pos    # np.ndarray [x,y,z] 또는 None
         self.confidence = confidence
         self.box_xyxy   = box_xyxy
-        self.status     = status       # "OK" | "LOW_CONF" | "NOT_FOUND" | "DEPTH_INVALID"
+        self.status     = status       # "OK" | "LOW_CONF" | "GT_FALLBACK" | "NOT_FOUND" | "DEPTH_INVALID"
 
     def __repr__(self):
         if self.world_pos is not None:
@@ -196,9 +196,13 @@ class VisionResult:
                 f"conf={self.confidence:.3f}, world_pos={pos})")
 
 
-def find_object(robot_id: int, ee_link: int, text_query: str) -> VisionResult:
+def find_object(robot_id: int, ee_link: int, text_query: str,
+                gt_body_id: int | None = None) -> VisionResult:
     """
     엔드이펙터 카메라로 text_query 객체를 탐색하고 3D 월드 좌표를 반환.
+
+    gt_body_id: PyBullet body ID. 신뢰도가 CONF_LOW~CONF_HIGH 구간일 때
+                해당 body의 GT 좌표로 폴백한다. None이면 폴백 없이 LOW_CONF 반환.
     """
     rgb, depth_m, view_mat = capture_ee_camera(robot_id, ee_link)
 
@@ -215,7 +219,14 @@ def find_object(robot_id: int, ee_link: int, text_query: str) -> VisionResult:
         return VisionResult(None, conf, box, "NOT_FOUND")
 
     if conf < CONF_HIGH:
-        print(f"[Vision] ⚠ 신뢰도 낮음 ({conf:.3f}). 오퍼레이터 확인이 필요합니다.")
+        print(f"[Vision] ⚠ 신뢰도 낮음 ({conf:.3f}, {CONF_LOW}~{CONF_HIGH}).")
+        if gt_body_id is not None:
+            gt_pos, _ = p.getBasePositionAndOrientation(gt_body_id)
+            world_pos = np.array(gt_pos, dtype=np.float64)
+            print(f"[Vision] GT 폴백 적용 (body_id={gt_body_id}): "
+                  f"{[round(v, 4) for v in world_pos]}")
+            return VisionResult(world_pos, conf, box, "GT_FALLBACK")
+        print("[Vision] gt_body_id 미제공 — LOW_CONF로 비전 좌표 사용.")
         status = "LOW_CONF"
     else:
         status = "OK"
