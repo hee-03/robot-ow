@@ -1,0 +1,122 @@
+python panda_pick_red_box.py
+빨간 상자를 0.3, 0.45, 0.04 로 빠르게 옮겨줘
+
+기본 로봇 pick & drop ---------------------
+페이즈	동작	PID
+Phase 1 APPROACH	박스 위 20cm 호버링	CAREFUL
+Phase 2 GRIPPER_CHECK	그리퍼 개방 확인	-
+Phase 3 DESCEND	박스 표면까지 하강	CAREFUL 강제
+Phase 4 GRASP	그리퍼 닫기 + 고정 제약	-
+Phase 5 LIFT	35cm 높이로 들어올리기	SLOW 최소
+핵심 구현 방식:
+
+박스: createMultiBody로 빨간 GEOM_BOX 생성 (질량 0.3kg)
+IK: calculateInverseKinematics (엔드이펙터 아래 방향 고정)
+파지: createConstraint(JOINT_FIXED)로 안정적 물체 고정
+
+페이즈	동작	목표 좌표
+Phase 6 TRANSIT	목적지 위로 수평 이동	[0.5, 0.3, 0.35]
+Phase 7 PLACE_DESCEND	바닥까지 하강	[0.5, 0.3, 0.06]
+Phase 8 RELEASE	제약 해제 → 그리퍼 개방 → 후퇴	-
+
+
+카메라로 객체 찾기 추가--------------------
+시뮬레이션 안정화 (120 steps)
+        ↓
+[Vision] EE 카메라 캡처 (RGB + Depth)
+        ↓
+OWL-ViT → "red box" 검출
+        ↓
+  conf ≥ 0.5 → 3D 월드 좌표 사용
+  conf 0.3~0.5 → 오퍼레이터 확인 후 진행
+  conf < 0.3 → NOT_FOUND, 종료
+        ↓
+Phase 1~8 (pick & place)
+
+
+LLM 처리 -----------------------------
+>> 빨간 네모를 0.3 0.2 0.05 로 빠르게 옮겨줘
+         ↓
+[nl_parser] LLM 파싱
+  object     = "red box"
+  destination = [0.3, 0.2, 0.05]
+  speed_level = "fast"  →  Kp=1.5, Kd=0.1, max_vel=0.4
+         ↓
+[Scan] 스캔 자세 → joint0 360° 회전 + OWL-ViT로 "red box" 탐색
+         ↓
+[Phase 1~4] 발견 좌표로 APPROACH → DESCEND(CAREFUL) → GRASP
+         ↓
+[Phase 5]   LIFT (SLOW 최소)
+         ↓
+[Phase 6]   TRANSIT → [0.3, 0.2, LIFT_HEIGHT]  (fast PID)
+         ↓
+[Phase 7~8] PLACE_DESCEND(CAREFUL) → RELEASE
+
+수정사항--------------------------
+nl_parser.py — {} → {{}} 이스케이프 처리 (LangChain 템플릿 변수 오인 방지)
+
+panda_pick_red_box.py — 실행 순서 변경:
+
+
+1. init_sim() + load_plane() + load_panda() + load_red_box()  ← GUI 먼저 열림
+2. 120 steps 안정화  ← 로봇이 화면에 정지 상태로 표시
+3. input(">> ")  ← 여기서 자연어 입력 대기
+4. parse_command() → 스캔 → pick & place
+
+다중 물체 감지 및 이동---------------
+배치 물체 3종:
+
+물체	색상	위치
+red box	빨간 네모	[-0.5, 0.2, 0.025]
+blue cylinder	파란 원기둥	[0.4, -0.2, 0.05]
+green sphere	초록 구	[0.3, 0.45, 0.04]
+
+실행 흐름:
+1. PyBullet GUI 열림 → 3개 물체 + 로봇 표시
+2. 자연어 입력 대기
+   >> 빨간 네모를 0.3 0.2 0.025 로 빠르게 옮겨줘
+3. LLM 파싱 → object, destination, speed_level
+4. 360° 스캔 → OWL-ViT로 해당 물체 탐색
+5. 목적지 주변 12cm 이내 다른 물체 감지 시
+   → 해당 물체를 x+15cm, y+15cm로 먼저 이동
+6. 목표 물체 pick & place → 지정 좌표에 내려놓기
+
+
+[Scan] ── 반시계(CCW) +160° 탐색 시작 ──
+  └─ 'green sphere' 감지  conf=0.71  좌표=[0.3, 0.45, 0.04]
+  └─ 'red box' 감지       conf=0.62  좌표=[-0.5, 0.2, 0.03]
+[Scan] ── 반시계(CCW) +160° 완료, 원위치 복귀 ──
+[Scan] ── 시계(CW)   -160° 탐색 시작 ──
+  └─ 'blue cylinder' 감지 conf=0.55  좌표=[0.4, -0.2, 0.05]
+[Scan] ── 시계(CW)   -160° 완료, 원위치 복귀 ──
+[Scan] 탐색 완료 — 3개 감지: ['green sphere', 'red box', 'blue cylinder']
+핵심 변경
+
+scan_360 (단일 객체 탐색) → scan_full_range (전체 객체 동시 탐색)
+CCW phase: 0 → +160°, SCAN_STEP_DEG(20°)마다 샘플링 후 원위치 복귀
+CW phase: 0 → -160°, 동일 방식
+감지 시 즉시 이름 + 좌표 출력, 중복 출력 방지
+
+streamlit 구현 내용-------------------------
+robot_sim.py — 시뮬레이션 백그라운드 클래스
+panda_pick_red_box.py의 로직을 RobotSimulation 클래스로 재구성:
+
+변경 사항	내용
+p.connect(p.GUI) → p.connect(p.DIRECT)	별도 창 없이 실행
+@st.cache_resource 싱글톤	Streamlit 리런 간 인스턴스 유지
+_step_sim()	매 12스텝마다 프레임 캡처 (~20fps)
+queue.Queue	자연어 명령을 스레드 안전하게 전달
+스레드 잠금	프레임·로그·상태를 Lock으로 보호
+streamlit_app.py — 웹 UI
+오버뷰 탭: 고정 카메라로 전체 씬 표시 (20fps 자동 갱신)
+EE 카메라 탭: 로봇 엔드이펙터 시점 (~5fps)
+실행 로그 탭: 실시간 작업 로그
+제어 패널: 자연어 입력 + 4개 빠른 예시 버튼 + 물체 현재 좌표
+
+신뢰도 향상 ---------------
+변경 내용 (panda_pick_red_box.py:231-232, 271-301)
+
+INFER_PER_ANGLE = 2 — 각도별 추론 횟수 상수 추가 (나중에 조정 쉽게)
+INFER_SETTLE = 8 — 추론 사이 p.stepSimulation() 8회 실행해 물리 상태 미세 변화 유도
+best_at_angle dict에 한 각도의 N회 결과를 모두 수집 → 최고 신뢰도만 전체 detected에 반영
+보고(reported) 출력도 최고값 확정 후 1회만 출력하도록 정리
