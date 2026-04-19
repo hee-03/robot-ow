@@ -217,8 +217,10 @@ def move_to_scan_pose(robot):
         time.sleep(1.0 / 240.0)
 
 
-JOINT_LIMIT_DEG = 160   # 안전 탐색 한계 (Panda Joint 0 최대 ±166°)
-RETURN_STEPS    = 400   # 원위치 복귀용 시뮬레이션 스텝 수
+JOINT_LIMIT_DEG  = 160   # 안전 탐색 한계 (Panda Joint 0 최대 ±166°)
+RETURN_STEPS     = 400   # 원위치 복귀용 시뮬레이션 스텝 수
+INFER_PER_ANGLE  = 2     # 각도별 추론 횟수 (최고 신뢰도 채택)
+INFER_SETTLE     = 8     # 추론 사이 물리 안정화 스텝
 
 
 def _drive_joint0(robot, target_rad: float, steps: int = SCAN_SIM_STEPS):
@@ -271,7 +273,14 @@ def scan_full_range(robot, object_names: list) -> dict:
         for target_rad in angles:
             _drive_joint0(robot, target_rad)
 
-            for _ in range(2):   # ← 여기 추가
+            # 각도별 INFER_PER_ANGLE회 추론 후 최고 신뢰도만 채택
+            best_at_angle: dict[str, tuple] = {}
+
+            for infer_idx in range(INFER_PER_ANGLE):
+                if infer_idx > 0:
+                    for _ in range(INFER_SETTLE):
+                        p.stepSimulation()
+
                 rgb, depth_m, view_mat = capture_ee_camera(robot, EE_LINK)
                 results = detect_multiple(rgb, object_names)
 
@@ -284,14 +293,17 @@ def scan_full_range(robot, object_names: list) -> dict:
                     world_pos = pixel_to_world(cx, cy, depth_m, view_mat)
                     if world_pos is None:
                         continue
+                    if name not in best_at_angle or score > best_at_angle[name][0]:
+                        best_at_angle[name] = (score, world_pos)
 
-                    if detected[name] is None or score > detected[name][0]:
-                        detected[name] = (score, world_pos)
-
-                    if name not in reported:
-                        reported.add(name)
-                        pos = [round(float(v), 3) for v in world_pos]
-                        print(f"  └─ '{name}' 감지  conf={score:.2f}  좌표={pos}")
+            # 이번 각도의 최고 결과를 전체 detected에 반영
+            for name, (score, world_pos) in best_at_angle.items():
+                if detected[name] is None or score > detected[name][0]:
+                    detected[name] = (score, world_pos)
+                if name not in reported:
+                    reported.add(name)
+                    pos = [round(float(v), 3) for v in world_pos]
+                    print(f"  └─ '{name}' 감지  conf={score:.2f}  좌표={pos}")
 
         log("Scan", f"── {phase_label} 완료, 원위치 복귀 ──")
         drive_joint0_until(robot, 0.0)

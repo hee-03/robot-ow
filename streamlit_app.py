@@ -16,19 +16,47 @@ st.set_page_config(
 # ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
+    /* 전체 기본 폰트 크기 확대 */
+    html, body, [class*="css"] {
+        font-size: 18px !important;
+    }
+
+    /* 제목 */
+    h1 { font-size: 2rem !important; }
+    h2 { font-size: 1.6rem !important; }
+    h3 { font-size: 1.4rem !important; }
+
+    /* 일반 텍스트, 라벨, 캡션, 버튼 */
+    p, span, div, label, button,
+    textarea, input,
+    [data-testid="stText"],
+    [data-testid="stCaption"],
+    [data-testid="stMarkdown"] p {
+        font-size: 18px !important;
+    }
+
+    /* 버튼 텍스트 */
+    .stButton > button { font-size: 17px !important; padding: 8px 16px !important; }
+
+    /* 탭 라벨 */
+    [data-testid="stTab"] button { font-size: 17px !important; }
+
+    /* 물체 위치 코드 블록 */
+    code { font-size: 16px !important; }
+
+    /* 상태 박스 */
     .status-box {
         background: #1e1e2e;
         border-radius: 8px;
-        padding: 10px 14px;
+        padding: 12px 16px;
         color: #cdd6f4;
         font-family: monospace;
-        font-size: 13px;
+        font-size: 17px !important;
         margin-bottom: 6px;
     }
     .status-ok   { border-left: 4px solid #a6e3a1; }
     .status-busy { border-left: 4px solid #f9e2af; }
     .status-err  { border-left: 4px solid #f38ba8; }
-    div[data-testid="stMetricValue"] { font-size: 14px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -46,7 +74,7 @@ def get_simulation():
 st.title("Robot OW — 자연어 로봇 제어 시연")
 st.caption("Franka Panda 7-DOF  ·  OWL-ViT 비전  ·  LangChain/Ollama")
 
-col_view, col_ctrl = st.columns([3, 1.2], gap="medium")
+col_view, col_ctrl = st.columns([2, 1.5], gap="medium")
 
 # ── 제어 패널 ─────────────────────────────────────────────────────────────────
 with col_ctrl:
